@@ -1,28 +1,27 @@
 # -*- coding: utf-8 -*-
 
-# ---------------------------------------------------------------------------
-# 可填充索引 index: by_label + header_fields + rows (+ cells + report)
-#
-# 表头行 (role=header, 含"规定值"类列名的行) 为分界线, 构建时自动识别:
-#   表头行以上 -> 上下文区: label 格 -> 同排右侧值格, 进 header_fields,
-#                 目录 context 纯字典查找填充 (空值格=覆盖写, 带占位文本=
-#                 inline 替换), 与数据区互不干扰;
-#   表头行以下 -> 数据区: 按行分组还原 "字段 -> 规定值/实测值/合格率" 结构,
-#                 进 rows, 数据简表按 行标签+列名 填充;
-#   全表       -> by_label: 所有带 label 的字段 (兜底和通用查找)。
-# uuid 由 addr 确定性生成 (uuid5), 同表重建一致; cells 表携带每格几何/
-# 占位文本/mode, 回填渲染只查 cells[uuid]。占位覆盖/无值格/缺列等边界
-# 构建期全部进 report, 不等到运行期。
-#
-# 填充语义 (cells[uuid] 的 mode):
-#   overwrite  text 为空, 直接写入 value
-#   replace    整格替换 (占位文字视为示例值, 如 工程部位 的 "土方路基")
-#   append     值追加在占位文本之后 (标签与值同格, 如 抽检时间)
-#   inline     替换占位文本片段 (同行冒号内联, 如 编号: JB12-...)
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# 可填充索引 index: by_label + header_fields + rows (+ cells + report)
-# ---------------------------------------------------------------------------
+"""把字段配对和表格拓扑编译为带诊断信息的可填充索引。
+
+索引以 UUID 为主键，包含五部分：
+- ``header_fields``：表头以上的上下文字段，按规范化字段名直接查找；
+- ``rows``：表体行，按“行标签 -> 列名 -> 值格”还原规定值、实测值等结构；
+- ``by_label``：全表标签兜底索引，一个规范化标签可对应多个格子；
+- ``cells``：UUID 到地址、几何、文本、字体及填充语义的映射；
+- ``report``：构建期发现的降级、缺失、重名和占位填充等诊断。
+
+有原生地址的格子用固定命名空间和 addr 生成 UUID5，因此同表重建结果稳定；
+无地址格子只能使用随机 UUID。回填渲染应以 cells 中的 UUID 为定位键，而
+不是重复解释字段配对规则。report 用于尽早暴露问题，不会替代可用索引。
+
+cells[uuid].mode 的填充语义：
+- overwrite：空格直接写入；
+- replace：整格替换示例或占位文本；
+- append：在标签文本后追加值；
+- inline：只替换标签前缀之后的占位片段。
+
+共享格可能被多个字段引用。顶层 mode/prefix/placeholder 保留旧索引契约，
+bindings 则逐字段保存各自的填充方式，防止后登记字段覆盖先登记字段。
+"""
 
 from importlib import import_module as _import_module
 
@@ -40,8 +39,15 @@ _INDEX_NS = None  # uuid5 namespace, 延迟生成
 
 
 def build_index(data):
-    """按上述契约生成 data['index']。依赖 extract_fields/assign_roles
-    的配对结果 (fields) 与网格几何, 在 build_form_view 之后调用。"""
+    """生成 data['index']，把字段和表格拓扑解析为 UUID 引用。
+
+    依赖 assign_roles 的角色、extract_fields 的配对结果及网格几何。上下文字段
+    与表体行分别进入 header_fields 和 rows，其余标签继续汇入 by_label；字段名
+    和行标签的索引键均去除全部空白，但 cells 中保留原始文本供回填定位。
+
+    构建以“尽量保留可用索引”为原则：未识别表头、缺值格、缺列、重名和几何
+    降级等问题写入 report，而不是在首个异常处中止整个索引。
+    """
     import re
     import uuid
     global _INDEX_NS
@@ -71,6 +77,8 @@ def build_index(data):
                 for it in sorted(items, key=lambda i: i['x']))
 
     idx_cells, report = {}, []
+    # report 是构建期诊断而非异常清单：warn 提示缺失、冲突或降级，
+    # info 记录占位填充、实测拆格等自动决策，便于回填前人工复核。
     _noaddr = {}  # id(cell) -> uuid (无 addr 的格, 每次运行不同)
 
     def ref(c):
@@ -80,6 +88,7 @@ def build_index(data):
             u = str(uuid.uuid5(_INDEX_NS, a))
         else:
             u = _noaddr.setdefault(id(c), str(uuid.uuid4()))
+        # 共享格只初始化一次；各字段的填充差异后续写入 bindings
         if u not in idx_cells:
             e = {'addr': a, 'x': round(c['x'], 1), 'y': round(c['y'], 1),
                  'w': round(c.get('w') or 0, 1),
@@ -87,10 +96,8 @@ def build_index(data):
             t = merged_text.get(a, (c.get('text') or '').strip())
             if t:
                 e['text'] = t
-            # 字号/字体/颜色: PDF 文字层 (lines, 实际打印样式) > 顶层原生
-            # 属性 (docx/xlsx 简化排版通路) > openpyxl 原生字体 (空值格
-            # 唯一来源) > 无; 对齐只有原生侧可得。
-            # 渲染层按此复原字体 (build_template -> style.fontFamily 等)
+            # 字号/字体/颜色: PDF 文字层 (lines, 实际打印样式) 优先,
+            # 其次使用格子的顶层样式属性; 供已有模板索引消费。
             ln0 = (c.get('lines') or [{}])[0] or {}
             size = c.get('size') or ln0.get('size') or c.get('font_size')
             bold = (c.get('bold') or ln0.get('bold')
@@ -143,9 +150,11 @@ def build_index(data):
                     pos = text.find(op, start)
                     if pos >= 0:
                         ends.append(pos)
+                # 有多个后续字段时，最近的前缀才是当前值段边界
                 end = min(ends) if ends else len(text)
                 placeholder = text[start:end].strip() or None
             if placeholder is None and not prefix:
+                # 缺少前缀时，用最后一个冒号后的内容兜底识别占位
                 placeholder = re.split(r'[:：]', text)[-1].strip() or text
         elif text:
             placeholder = text
@@ -205,6 +214,7 @@ def build_index(data):
         return next((c for c in all_ents if c.get('addr') == addr), None)
 
     if header_row is not None:
+        # 以表头最上沿为界，只把它上方的字段收入 header_fields
         hdr_y = min(c['y'] for c in cells if c['row'] == header_row)
         # ---- 上下文区: 表头行以上的 fields (label -> 同排右侧值格) ----
         for f in data.get('fields') or []:
@@ -275,11 +285,13 @@ def build_index(data):
                     if hcell is not None and rs:
                         hx0 = hcell['x']
                         hx1 = hcell['x'] + hcell['w']
+                        # 子格中心须落在实测表头宽度内，且行号受当前行标签 rowspan 限制
                         subs = [c for c in cells
                                 if c is not kc and c.get('addr')
                                 and hx0 - 1 <= c['x'] + c['w'] / 2
                                 < hx1 + 1
                                 and r <= c['row'] < r + rs]
+                        # 与 measured 列表的消费顺序一致：先按行，再按 x 从左到右
                         subs.sort(key=lambda c: (c['row'], c['x']))
                         col['cells'] = [ref(c) for c in subs]
                         report.append({
@@ -307,6 +319,7 @@ def build_index(data):
         u = ref(c)
         if u in registered:
             continue
+        # 跨过标签合并区域找右邻，作为未配对字段的值格候选
         right = by_grid.get((c['row'], c['col'] + c.get('colspan', 1)))
         value_u = None
         if right is not None and right.get('addr'):

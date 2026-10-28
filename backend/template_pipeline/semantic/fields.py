@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 
-# ---------------------------------------------------------------------------
-# 字段配对 (fields: 标签->值/内联; table_fields: 表体行)
-# ---------------------------------------------------------------------------
+"""把标签、值格和表体列配对为可供索引与回填消费的字段描述。
+
+输出分为两层：``fields`` 描述表单字段，记录标签地址、值地址以及内联、
+覆盖、下划线替换等填充提示；``table_fields`` 按“行标签 + 表头列名”描述
+表体中的空白填写格。标签和值可以分属两格，也可以共处一格；后者需要保留
+prefix、append 等信息，避免回填时误删标签。
+
+本模块只负责语义配对，不生成 UUID，也不执行数据简表匹配。网格邻接均以
+合并格的左上角为锚点，并通过 colspan/rowspan 跨越整个合并区域查找邻居。
+"""
 
 from importlib import import_module as _import_module
 
-from ..common import _NO_LABEL_PREFIX
+from ..constants import _NO_LABEL_PREFIX
 
 _xlsx_anchor = _import_module('..align.xlsx_anchor', __package__)
 from .table_topology import (
@@ -28,6 +35,7 @@ def _is_placeholder(text):
     import re
     global _PLACEHOLDER_RE
     if _PLACEHOLDER_RE is None:
+        # 至少含“年/月/日”之一，且整串只能由日期占位字符组成
         _PLACEHOLDER_RE = re.compile(r'^(?=.*[年月日])[\s0-9年月日./-]{2,15}$')
     return bool(_PLACEHOLDER_RE.match((text or '').strip()))
 
@@ -36,14 +44,24 @@ _COLON_RE = None  # 延迟编译, 见 extract_fields
 
 
 def extract_fields(data):
-    """从角色标注中产出可回填字段: fields (标签->值/内联) + table_fields。
+    """从角色标注中产出可回填字段，并写入 fields 与 table_fields。
 
-    - 格内联冒号: 整格文本形如 "编 号：xxx" -> inline 字段, prefix 为冒号前;
-    - 标签->值对: label 角色格优先配右邻 (下划线占位格也算), 下邻次之;
-    - 游离文字行: 按基线聚行后同样匹配冒号模式, 用原生 addr 或几何 #T
-      伪地址寻址, value_seg 为值起始的下标位置;
-    - 表体行: 表头行之下, 行标签列 = 非空格最多的列; 每个行标签下,
-      只收集"标签行该列为空"的表头列, 优先取下一行 (专用填写行) 的地址。
+    fields 的 label/value 使用原生地址或既有伪地址；内联字段允许二者指向
+    同一格，prefix 用于保护标签文本，replace/underscore/append 则提示后续
+    索引采用何种填充方式。配对成功的值格会同步标记 fillable。
+    table_fields 只保留表体中的空白填写格，已有内容仍留在拓扑中供索引登记。
+
+    配对来源按以下次序处理：
+    - 格内联冒号：整格文本形如“编 号：xxx”时生成 inline 字段，prefix 为
+      冒号及之前的标签；
+    - 标签到值格：label 角色格优先配右邻（下划线和日期占位格也算），
+      右邻不合适时再尝试下邻；
+    - 同格右侧留白：标签与值被识别成同一格时，利用对齐阶段的 value_room
+      或行尾位置生成追加/覆盖配对；
+    - 游离文字行：按基线聚行后扫描多个“标签：值”，使用原生 addr 或 #T
+      伪地址寻址，value_seg 是值起点所在的视觉行分段下标；
+    - 表体行：以拓扑发现的行标签和表头列名为键，优先选本行空格，必要时
+      使用专用填写行，但不错用下一条目或备用空行。
     """
     import re
     global _COLON_RE
@@ -63,6 +81,7 @@ def extract_fields(data):
         t = (c.get('text') or '').strip()
         m = _COLON_RE.match(t)
         if m and len(t) <= 20 and c.get('addr'):
+            # 去掉末尾冒号及标签内空白，得到用于匹配的字段名
             name = re.sub(r'\s+', '', re.sub(r'\s*[:：]\s*$', '',
                                              m.group(1)))
             if name:
@@ -76,6 +95,7 @@ def extract_fields(data):
         name = re.sub(r'\s+', '', re.sub(r'\s*[:：]\s*$', '', text_of(c)))
         if not name:
             continue
+        # 右邻定位必须跨过整个合并格，不能简单取 col + 1
         target = by_grid.get((c['row'], c['col'] + c['colspan']))
         replace = False
         if target is not None and text_of(target) \
@@ -111,6 +131,7 @@ def extract_fields(data):
     #      标签之后 (如 "抽检时间" 后的大片空格)
     topology = discover_table(cells)
     table_rows = topology['table_rows']
+    # 已作为标签或值登记的地址不再参与同格留白配对
     claimed = {a for f in fields for a in (f.get('label'), f.get('value'))}
     for c in cells:
         if c.get('role') in ('header', 'title', 'value') \
@@ -169,6 +190,7 @@ def extract_fields(data):
                     or '□' in name:
                 continue
             value_start = m.end()
+            # 当前字段的值段在下一个标签起点前结束，避免串联多个字段
             value_end = (matches[k + 1].start() if k + 1 < len(matches)
                          else len(joined))
             ls = seg_at(m.start())

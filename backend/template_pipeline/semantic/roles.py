@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 
-# ---------------------------------------------------------------------------
-# 角色标注 (title|header|label|value|data)
-# ---------------------------------------------------------------------------
+"""用版式与邻接关系为格子标注语义角色，并标记可直接填写的空格。
+
+角色含义：title 是表单标题，header 是表体列名，label 是待填字段的名称，
+value 是空白填写格，data 是其余已有内容。角色描述的是格子在表单中的用途，
+不等于数据简表的 specified/measured/pass_rate 列角色。
+
+识别依赖字体、边框、表头与表体的位置以及合并格邻接关系；字段配对阶段还会
+把带示例文本的值格补标为 fillable，因此本阶段的 value 并非全部可写值格。
+"""
 
 from importlib import import_module as _import_module
 
-from ..common import _NO_LABEL_PREFIX
+from ..constants import _NO_LABEL_PREFIX
 from .fields import _is_placeholder
 
 _xlsx_anchor = _import_module('..align.xlsx_anchor', __package__)
@@ -15,10 +21,14 @@ from .table_topology import _pick_header_row, _table_rows_set
 
 
 def assign_roles(data):
-    """给每个格子标注角色 title|header|label|value|data 并标 fillable。
+    """给格子标注 title/header/label/value/data，并按需标记 fillable。
 
-    纯启发式 (按序判定, 先命中先生效), 供回填定位; 结果打印统计,
-    配合 overlay.png 人工核对。表头行之下的空边框格一律可填 (含备用空行)。
+    这是供回填定位使用的有序启发式流程：先识别标题和真表头，再由表头向下
+    圈定表体，随后处理表体空格、表单体标签及其相邻值格，最后把剩余非空格
+    归为 data。表头以下的空边框格均可填，包括专用填写行和备用空行；表尾
+    的“检查结论/审核人”等区域不参与表体规则。
+
+    结果会直接写回各 cell，并打印角色统计，可配合 overlay.png 人工核对。
     """
     _ensure_pseudo_addr(data)
     cells = data['cells']
@@ -35,6 +45,7 @@ def assign_roles(data):
         return [l['size'] for l in c.get('lines', []) if 'size' in l]
 
     sizes = sorted(s for c in cells for s in cell_sizes(c))
+    # 用全页字号中位数代表正文，避免少量标题大字把标题识别阈值整体抬高。
     body = sizes[len(sizes) // 2] if sizes else 10.0
 
     # 1) title: 格内大字且接近页水平居中 (四边全框的格是表格字段, 排除)
@@ -43,6 +54,7 @@ def assign_roles(data):
         if all(b.get(s) for s in ('top', 'bottom', 'left', 'right')):
             continue
         szs = cell_sizes(c)
+        # 标题阈值：最大字号至少为正文 1.3 倍，水平偏移小于页宽 12%
         if szs and max(szs) >= body * 1.3 \
                 and abs(c['x'] + c['w'] / 2 - page_cx) < data['width'] * 0.12:
             c['role'] = 'title'
@@ -106,8 +118,10 @@ def assign_roles(data):
         t = text_of(c)
         if not t or len(t) > 12 or t[0] in _NO_LABEL_PREFIX:
             continue
+        # 邻居查找跨过当前格的 colspan/rowspan，适配合并标签格
         right = by_grid.get((c['row'], c['col'] + c['colspan']))
         below = by_grid.get((c['row'] + c['rowspan'], c['col']))
+        # 下划线和日期占位虽非空，仍按可填写值格处理
         right_empty = right is not None and (
             not text_of(right) or '___' in (right.get('text') or '')
             or _is_placeholder(right.get('text')))

@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
 
-# ---------------------------------------------------------------------------
-# 通用表格拓扑: 表头、表体、行标签列和可填值格只发现一次
-# ---------------------------------------------------------------------------
+"""统一发现表头、表体、行标签列和各列候选值格。
 
-from ..common import _NO_LABEL_PREFIX
+角色标注、字段配对和索引构建共用这里的拓扑，避免各自推断表体边界而产生
+错位。拓扑描述“哪一行属于哪一列”：headers 保存列号到列名，table_rows 是
+连续表体的行号集合，rows 则保存行标签格及每个表头列的目标格。
+
+目标格不等于待填空格：已有内容的规定值格也会保留，供索引展示或校验；是否
+可填由 fields/index 分别筛选。找不到合适目标时用 None 保留缺列事实。
+"""
+
+from ..constants import _NO_LABEL_PREFIX
 
 
 def _norm_text(s):
-    """去掉所有空白后的文本, 用于跨源匹配 (PDF 文字层 vs openpyxl 值)。"""
+    """去掉所有空白后的文本, 用于跨源匹配。"""
     return ''.join(str(s).split())
 
 
@@ -23,6 +29,7 @@ def _group_free_text_lines(texts):
                    key=lambda it: (it['y'], it['x']))
     lines = []
     for it in items:
+        # y 坐标差不超过 6 的文字片段归为同一视觉行
         if lines and abs(it['y'] - lines[-1]['y']) <= 6:
             lines[-1]['items'].append(it)
         else:
@@ -59,10 +66,12 @@ def _label_col(counts):
 
 
 def _table_rows_set(cells, header_row):
-    """表体区行集合: 表头行之下、行标签列 (非空格最多的列) 之左无文本的连续行。
+    """返回表头之下连续表体的行号集合，排除表单尾区。
 
-    表体区之后的行 (检查结论/审核人等表单尾区) 返回时不包含,
-    供角色/字段区分"表格"与"表单尾部"。
+    先按表头下方各列的非空格计数估计行标签列，再逐行向下扩展。行标签列
+    左侧出现文本通常意味着进入新区块；符合“短标签 + 右侧至多一格且无
+    内容”的行则更像检查结论、审核人等尾区，两种情况都终止表体。
+    空白填写行本身不会截断表体，因此专用填写行和备用空行仍会保留。
     """
     by_row = {}
     for c in cells:
@@ -75,6 +84,7 @@ def _table_rows_set(cells, header_row):
     if counts:
         label_col = _label_col(counts)
         r = header_row + 1
+        # 只沿连续行号向下扩展，遇到断行即结束表体
         while r in by_row:
             row_cells = by_row[r]
             if any((c.get('text') or '').strip()
@@ -102,11 +112,17 @@ def _table_rows_set(cells, header_row):
 
 
 def discover_table(cells, header_rows=None):
-    """统一发现表格拓扑及每行的候选值格。
+    """统一发现表格拓扑及每个“行标签 × 表头列”的候选值格。
+
+    header_rows 可传入外部候选行；缺省使用 role=header 的格子。没有表头时
+    返回带空集合的同构结果，调用方无需另写缺表头分支。
 
     返回字典含 header_row/headers/table_rows/label_col/by_grid/rows。
-    rows[].columns 保留所有表头列 (target 可能为 None); 已有内容的同行格
-    也可作为规定值等列的目标, fields 只挑其中的空格, index 则登记全部。
+    rows 只包含有行标签的条目行，专用空白填写行不会被误当成新条目。
+    rows[].columns 保留所有非行标签表头列，target 可能是已有内容格、空格或
+    None：同行已有内容会保留；填写目标优先取同行带地址的空格，仅在下邻行
+    没有新行标签时才回退到下一行，避免错位到备用空行或下一条目。
+    fields 后续只挑其中的空格，index 则登记全部目标并报告缺列。
     """
     if header_rows is None:
         header_rows = {c['row'] for c in cells if c.get('role') == 'header'}
@@ -127,6 +143,7 @@ def discover_table(cells, header_rows=None):
     for c in cells:
         if c['row'] in table_rows and (c.get('text') or '').strip():
             counts[c['col']] = counts.get(c['col'], 0) + 1
+    # 没有表体文字或表头时，不强行推断行标签列
     label_col = _label_col(counts) if counts and headers else None
     result.update(headers=headers, table_rows=table_rows,
                   label_col=label_col, by_grid=by_grid)
@@ -145,6 +162,7 @@ def discover_table(cells, header_rows=None):
             if hc == label_col:
                 continue
             target = by_grid.get((r, hc))
+            # 同行非空目标直接保留；仅空格或缺格需要重新选值格
             if target is None or not (target.get('text') or '').strip():
                 target = None
                 # 本行空格优先; 下一行仅在同行没有地址时回退, 避免错位到

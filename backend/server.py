@@ -1,16 +1,15 @@
-"""表单模板服务: Vue 前端 (frontend/frontend/dist) + 转换管线的对接后端。
+"""表单识别与匹配服务: 简表图片识别 + 已有模板库匹配回填。
 
-接口与 frontend/src/api/template.ts 一一对应:
+接口:
     GET  /templates                 模板库列表 (扫描 root 下所有 template.json)
     GET  /templates/{id}            加载模板 -> {template: Template}
-    POST /templates/{id}/save       保存前端编辑后的 Template JSON
-    DELETE /templates/{id}          删除模板文件
-    POST /upload                    上传 xlsx/docx/pdf, 跑转换管线, 返回模板
+    POST /sheet                     上传简表图片, 识别为 简化.json 同构 JSON
+    POST /templates/{id}/match-sheet 上传数据简表, 按指定模板匹配回填
     POST /match-sheet               上传数据简表, 按 表名/编号 自动路由模板
                                     并匹配回填, 返回 templateUuid + values
 静态:
     /        Vue 前端 (dist/, 未构建时提示)
-    /files/  项目根目录 (转换输出目录的背景图等, template.json 里的
+    /files/  项目根目录 (已有模板的背景图与简表预览图, template.json 里的
              page.background 相对路径在加载时改写为 /files/...)
 
 用法:
@@ -33,35 +32,34 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-# 转换管线公开函数 (叶子模块直取, 不经根目录兼容 shim)
-from backend.template_pipeline.office_fb.render import render_data_background
-from backend.template_pipeline.office_fb.xlsx_reader import xlsx_to_data
-from backend.template_pipeline.output.frontend import generate_frontend
-from backend.template_pipeline.output.template import build_template
-from backend.template_pipeline.pipeline.document import convert_document
+# 识别/匹配管线公开函数 (叶子模块直取, 不经根目录兼容 shim)
 from backend.template_pipeline.pipeline.page import extract_page
 from backend.template_pipeline.semantic.fields import extract_fields
 from backend.template_pipeline.semantic.index import build_index
 from backend.template_pipeline.semantic.match import match_data_fields
 from backend.template_pipeline.semantic.roles import assign_roles
-from backend.template_pipeline.semantic.sheet_input import (
-    parse_data_sheet, photo_to_sheet)
+from backend.template_pipeline.semantic.sheet_input import photo_to_sheet
+from backend.template_pipeline.semantic.simplified_sheet import sheet_to_simplified
 
 # 扫描模板时跳过依赖、缓存与非模板生成目录 (与 .gitignore 对齐)
 _SKIP_DIRS = {'.git', '.venv', 'node_modules', '_tmp_form', '_uploads',
               '_sandbox', 'dist', '__pycache__'}
 _IMG_EXT = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
-_EXT_OK = ('.xlsx', '.docx', '.pdf') + _IMG_EXT
 _SCAN_TTL = 2.0
-_DELETE_MARKER = '.template_deleted'
 
+# 模板注册表是进程级只读快照；扫描线程先构建新表，再在锁内整体替换，
+# 避免请求线程看到扫描到一半的注册表。
 _registry = {}  # templateUuid -> template.json 绝对路径
 _registry_lock = threading.RLock()
 _registry_scanned_at = 0.0
 
 
 def _index_score(template_path):
-    """同 UUID 多份产物的回填可用性：数据行、上下文字段、通用标签。"""
+    """返回同 UUID 模板产物的完整性评分。
+
+    评分依次比较数据行、上下文字段和通用标签的数量；缺失或损坏的
+    form.json 按空索引处理，不阻断其他模板的扫描。
+    """
     try:
         with open(os.path.join(os.path.dirname(template_path), 'form.json'),
                   encoding='utf-8') as f:
@@ -74,7 +72,11 @@ def _index_score(template_path):
 
 
 def scan_templates(root):
-    """按短 TTL 扫描模板, 构建完整新注册表后一次性替换。"""
+    """扫描 root 下的模板并刷新注册表，两次完整扫描至少间隔 2 秒。
+
+    每个模板目录必须包含 template.json；form.json 仅用于评估同 UUID
+    候选的索引完整性。损坏的单个模板会被跳过，不影响其余模板。
+    """
     global _registry, _registry_scanned_at
     with _registry_lock:
         now = time.monotonic()
@@ -83,10 +85,10 @@ def scan_templates(root):
         new_registry = {}
         new_scores = {}
         for dirpath, dirnames, filenames in os.walk(root):
+            # 原地裁剪 dirnames 才会阻止 os.walk 继续进入依赖和缓存目录。
             dirnames[:] = [d for d in dirnames
                            if d not in _SKIP_DIRS and not d.startswith('.')]
-            if 'template.json' not in filenames \
-                    or _DELETE_MARKER in filenames:
+            if 'template.json' not in filenames:
                 continue
             path = os.path.join(dirpath, 'template.json')
             try:
@@ -101,12 +103,17 @@ def scan_templates(root):
                     new_scores[tid] = score
             except Exception as e:
                 print(f'[scan] 跳过 {path}: {e}')
+        # 一次性替换完整快照，请求不会读到只扫描了一半的注册表。
         _registry = new_registry
         _registry_scanned_at = time.monotonic()
 
 
 def bg_to_url(tpl, path, root):
-    """page.background 相对路径改写为 /files/... 服务地址。"""
+    """将模板各页的相对背景图路径改为 /files/... URL。
+
+    绝对 URL 和已经以斜杠开头的服务路径保持不变；返回原模板字典，
+    调用方得到的是已就地更新的页数据。
+    """
     base = '/files/' + os.path.dirname(os.path.relpath(path, root)) \
         .replace(os.sep, '/')
     for page in tpl.get('pages') or []:
@@ -117,13 +124,12 @@ def bg_to_url(tpl, path, root):
 
 
 def _convert_args():
-    """与 main() 默认参数一致的 Namespace。"""
+    """图片识别参数的集中默认值。"""
     import argparse
     return argparse.Namespace(
         page=0, dpi=300, h_ratio=0.1, v_ratio=0.03, h_min_span=0.28,
         v_min_span=0.04, h_span_ratio=0.45, v_span_ratio=0.20,
-        no_ocr=False, force_ocr=False,
-        out=None, input=None, h_ratio_set=None)
+        no_ocr=False, out=None)
 
 
 def _route_template(sheet):
@@ -135,6 +141,7 @@ def _route_template(sheet):
     import re
 
     def norm(s):
+        # 比较前统一括号并移除空白，吸收 OCR 与模板录入的格式差异。
         s = str(s or '').translate({ord('（'): '(', ord('）'): ')'})
         return re.sub(r'\s+', '', s)
 
@@ -174,6 +181,7 @@ def _route_template(sheet):
                         or sheet_code.startswith(t_code):
                     score += 3
         if best is None or score > best[1]:
+            # 同分保留先扫描到的模板；是否可用由调用方检查最高分是否大于 0。
             best = (tid, score)
     return best
 
@@ -195,6 +203,7 @@ def _safe_upload_name(filename):
 
 
 def _remove_file(path):
+    """尽力删除请求暂存文件；文件已不存在或清理失败时不覆盖业务结果。"""
     try:
         if path and os.path.isfile(path):
             os.remove(path)
@@ -203,43 +212,46 @@ def _remove_file(path):
 
 
 def _parse_sheet_file(tmp, ext):
-    """在线程池中解析已暂存的数据简表。"""
+    """在线程池中执行完整识别管线，将暂存图片转换为内部简表。
+
+    几何检测、OCR、角色标注、字段抽取和索引构建均在这里串行完成；
+    本函数不读取模板，也不做字段匹配。
+    """
     from fastapi import HTTPException
-    if ext == '.xlsx':
-        sheet = parse_data_sheet(tmp)
-        empty_hint = ''
-    else:
-        data = extract_page(tmp, 0, _convert_args())
-        if not data or not data.get('cells'):
-            raise HTTPException(400, '照片中未检测到表格, 请拍正拍清晰后重试')
-        assign_roles(data)
-        extract_fields(data)
-        build_index(data)
-        sheet = photo_to_sheet(data)
-        print(f"[match-sheet] 照片简表: title={sheet['title']} "
-              f"fields={len(sheet['fields'])}")
-        empty_hint = ('; 照片识别率有限, 若简表本身是 Excel, '
-                      '建议直接上传 .xlsx 文件而非截图/照片')
+    data = extract_page(tmp, 0, _convert_args())
+    if not data or not data.get('cells'):
+        raise HTTPException(400, '照片中未检测到表格, 请拍正拍清晰后重试')
+    assign_roles(data)
+    extract_fields(data)
+    build_index(data)
+    sheet = photo_to_sheet(data)
+    print(f"[match-sheet] 照片简表: title={sheet['title']} "
+          f"fields={len(sheet['fields'])}")
     if not sheet['fields']:
         raise HTTPException(400,
                             '未能从简表解析出字段 '
-                            '(需要 项目/规定值/实测值 类表头)' + empty_hint)
+                            '(需要 项目/规定值/实测值 类表头)')
     return sheet
 
 
 async def _parse_sheet_upload(file, upload_dir):
-    """校验并暂存数据简表, 在线程池解析, 返回 (sheet, 暂存路径)。"""
+    """校验上传图片并暂存，在线程池识别后返回 ``(sheet, 暂存路径)``。
+
+    暂存文件使用随机 UUID 名称，避免不同请求互相覆盖；识别失败时立即
+    清理，成功时交由路由的 finally 块统一清理。
+    """
     import uuid
     from fastapi import HTTPException
     from fastapi.concurrency import run_in_threadpool
     _, ext = _safe_upload_name(file.filename)
-    if ext not in ('.xlsx',) + _IMG_EXT:
-        raise HTTPException(400, '仅支持 .xlsx 数据简表或已填表照片')
+    if ext not in _IMG_EXT:
+        raise HTTPException(400, '仅支持已填表简表图片')
     os.makedirs(upload_dir, exist_ok=True)
     tmp = os.path.join(upload_dir, f'sheet_{uuid.uuid4().hex}{ext}')
     try:
         with open(tmp, 'wb') as f:
             f.write(await file.read())
+        # 几何检测和 OCR 均为阻塞型 CPU 操作，放入线程池避免卡住事件循环。
         sheet = await run_in_threadpool(_parse_sheet_file, tmp, ext)
         return sheet, tmp
     except Exception:
@@ -248,29 +260,16 @@ async def _parse_sheet_upload(file, upload_dir):
 
 
 def _sheet_preview_url(path, upload_dir):
-    """给上传的数据简表生成左侧预览图, 返回 /files/... URL 或 None。
-
-    图片直接复用; xlsx 由 office_fb 简化排版自渲染成 PNG (缩到 1400 宽)。
-    按内容哈希缓存, 重复匹配不重复转换。失败静默返回 None (前端回退到
-    模板原图)。"""
+    """按内容哈希暂存上传图片, 返回 /files/... 预览 URL 或 None。"""
     import hashlib
     ext = os.path.splitext(path)[1].lower()
     try:
+        # 哈希仅用于相同图片的预览去重，不承担安全校验用途。
         digest = hashlib.md5(open(path, 'rb').read()).hexdigest()[:8]
-        if ext in _IMG_EXT:
-            dst = os.path.join(upload_dir, f'sheet_preview_{digest}{ext}')
-            if not os.path.exists(dst):
-                import shutil
-                shutil.copy(path, dst)
-        else:
-            dst = os.path.join(upload_dir, f'sheet_preview_{digest}.png')
-            if not os.path.exists(dst):
-                data = xlsx_to_data(path)
-                img = render_data_background(data)
-                w = 1400
-                if img.width > w:
-                    img = img.resize((w, round(img.height * w / img.width)))
-                img.save(dst)
+        dst = os.path.join(upload_dir, f'sheet_preview_{digest}{ext}')
+        if not os.path.exists(dst):
+            import shutil
+            shutil.copy(path, dst)
         rel = os.path.relpath(dst, os.path.dirname(upload_dir)) \
             .replace(os.sep, '/')
         return '/files/' + rel
@@ -279,66 +278,11 @@ def _sheet_preview_url(path, upload_dir):
         return None
 
 
-def convert_upload(src_path, stem, root, out_base):
-    """跑转换管线, 以源内容哈希重算 UUID; 失败时清理半成品目录。"""
-    import hashlib
-    import shutil
-    import uuid
-    out_dir = os.path.join(out_base, f'{stem}_{uuid.uuid4().hex[:6]}')
-    os.makedirs(out_dir, exist_ok=True)
-    try:
-        args = _convert_args()
-        args.input = src_path
-        args.out = out_dir
-        ext = os.path.splitext(src_path)[1].lower()
-        bg_url = '/files/' + os.path.relpath(out_dir, root) \
-            .replace(os.sep, '/') + '/background.png'
-        if ext in ('.xlsx', '.docx'):
-            data, office_pdf = convert_document(
-                src_path, out_dir, args)
-            build_template(
-                data, out_dir, source_paths=[office_pdf] if office_pdf else [],
-                name=stem, bg_url=bg_url,
-                source_ext=None if office_pdf else ext)
-        else:  # pdf / 图片: PDF 走文字层直提, 图片(扫描件)走 OCR 识别算法
-            if ext != '.pdf' and ext not in _IMG_EXT:
-                raise RuntimeError(
-                    f'不支持的文件格式: {ext} (仅支持 pdf / 图片 / .docx / .xlsx)')
-            data = extract_page(src_path, args.page, args)
-            if not data:
-                raise RuntimeError('页面提取失败')
-            generate_frontend(data, out_dir)
-            build_template(data, out_dir, source_paths=[src_path],
-                           name=stem, bg_url=bg_url)
-        template_path = os.path.join(out_dir, 'template.json')
-        with open(template_path, encoding='utf-8') as f:
-            tpl = json.load(f)
-        digest = hashlib.sha256()
-        with open(src_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b''):
-                digest.update(chunk)
-        old_tid = tpl.get('templateUuid')
-        tpl['templateUuid'] = str(uuid.uuid5(
-            uuid.NAMESPACE_URL, f'{digest.hexdigest()}\0{stem}'))
-        tmp_path = template_path + '.tmp'
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(tpl, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, template_path)
-        with _registry_lock:
-            if old_tid and _registry.get(old_tid) == template_path:
-                _registry.pop(old_tid, None)
-            tid = tpl['templateUuid']
-            registered = _registry.get(tid)
-            if registered is None or not os.path.isfile(registered) \
-                    or _index_score(template_path) > _index_score(registered):
-                _registry[tid] = template_path
-        return tpl
-    except Exception:
-        shutil.rmtree(out_dir, ignore_errors=True)
-        raise
-
-
 def create_app(root=ROOT):
+    """创建识别与匹配服务，所有模板、预览和静态资源均相对 root 定位。
+
+    CPU/图像处理及磁盘扫描通过线程池执行，避免阻塞 FastAPI 事件循环。
+    """
     from fastapi import FastAPI, File, HTTPException, Request, UploadFile
     from fastapi.concurrency import run_in_threadpool
     from fastapi.middleware.cors import CORSMiddleware
@@ -348,9 +292,8 @@ def create_app(root=ROOT):
     root = os.path.abspath(root)
     dist = os.path.join(root, 'frontend', 'frontend', 'dist')
     upload_dir = os.path.join(root, '_uploads')
-    out_base = os.path.join(root, 'out')
 
-    app = FastAPI(title='表单模板服务')
+    app = FastAPI(title='表单识别与匹配服务')
     app.add_middleware(CORSMiddleware, allow_origins=['*'],
                        allow_methods=['*'], allow_headers=['*'])
 
@@ -368,6 +311,7 @@ def create_app(root=ROOT):
 
     @app.get('/templates')
     def list_templates():
+        """返回当前注册表的模板摘要，不返回体积较大的完整页数据。"""
         scan_templates(root)
         summaries = []
         for tid, path in _registry.items():
@@ -386,6 +330,7 @@ def create_app(root=ROOT):
 
     @app.get('/templates/{tid}')
     def load_template(tid: str):
+        """读取指定模板，并将页背景图路径转换为可访问的静态 URL。"""
         scan_templates(root)
         path = _registry.get(tid)
         if not path:
@@ -393,48 +338,23 @@ def create_app(root=ROOT):
         with open(path, encoding='utf-8') as f:
             return {'template': bg_to_url(json.load(f), path, root)}
 
-    @app.post('/templates/{tid}/save')
-    def save_template(tid: str, body: dict):
-        scan_templates(root)
-        path = _registry.get(tid)
-        if not path:
-            raise HTTPException(404, '模板不存在')
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(body, f, ensure_ascii=False, indent=2)
-        return {'ok': True}
-
-    @app.delete('/templates/{tid}')
-    def delete_template(tid: str):
-        import shutil
-        scan_templates(root)
-        path = _registry.get(tid)
-        if not path:
-            raise HTTPException(404, '模板不存在')
-        template_dir = os.path.realpath(os.path.dirname(path))
-        managed = False
-        for base in (os.path.join(root, 'out'), os.path.join(root, 'grid_out')):
-            base = os.path.realpath(base)
-            try:
-                managed |= template_dir != base and os.path.commonpath(
-                    (template_dir, base)) == base
-            except ValueError:
-                pass
-        if managed:
-            shutil.rmtree(os.path.dirname(path))
-        else:
-            # 非托管目录不能整删; 留删除标记, 避免外部再生成 JSON 后复活。
-            with open(os.path.join(os.path.dirname(path), _DELETE_MARKER), 'w'):
-                pass
-            if os.path.exists(path):
-                os.remove(path)
-        with _registry_lock:
-            if _registry.get(tid) == path:
-                _registry.pop(tid, None)
-        return {'ok': True}
+    @app.post('/sheet')
+    async def sheet_from_photo(file: UploadFile = File(...)):
+        """上传一张简表图片, 返回与 简化.json 同构的 JSON。"""
+        _, ext = _safe_upload_name(file.filename)
+        if ext not in _IMG_EXT:
+            raise HTTPException(
+                400, f'仅支持图片简表 ({"/".join(_IMG_EXT)})')
+        tmp = None
+        try:
+            sheet, tmp = await _parse_sheet_upload(file, upload_dir)
+            return sheet_to_simplified(sheet)
+        finally:
+            _remove_file(tmp)
 
     @app.post('/templates/{tid}/match-sheet')
     async def match_sheet(tid: str, file: UploadFile = File(...)):
-        """上传数据简表 (xlsx), 解析成一次性 JSON 并按指定模板索引匹配,
+        """上传简表图片, 解析成一次性 JSON 并按指定模板索引匹配,
         返回 {title, fields, values: {fieldUuid: 值}, unmatched}。
         简表暂存文件在响应前清理, 内容哈希预览图可保留。"""
         tmp = None
@@ -469,7 +389,7 @@ def create_app(root=ROOT):
             if not routed or routed[1] <= 0:
                 raise HTTPException(
                     404, f"没有匹配到模板 (简表表名: {sheet['title'] or '未识别'}, "
-                         f"请先在模板库制作/上传对应模板表)")
+                         f"请确认模板库中已有对应模板)")
             tid = routed[0]
             with open(os.path.join(os.path.dirname(_registry[tid]), 'form.json'),
                       encoding='utf-8') as f:
@@ -484,33 +404,13 @@ def create_app(root=ROOT):
         finally:
             _remove_file(tmp)
 
-    @app.post('/upload')
-    async def upload(file: UploadFile = File(...)):
-        import uuid
-        stem, ext = _safe_upload_name(file.filename)
-        if ext not in _EXT_OK:
-            raise HTTPException(400, f'仅支持 {"/".join(_EXT_OK)}')
-        os.makedirs(upload_dir, exist_ok=True)
-        safe = os.path.join(upload_dir, f'{stem}_{uuid.uuid4().hex}{ext}')
-        try:
-            with open(safe, 'wb') as f:
-                f.write(await file.read())
-            tpl = await run_in_threadpool(
-                convert_upload, safe, stem, root, out_base)
-            return {'template': tpl}
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(500, f'转换失败: {e}')
-        finally:
-            _remove_file(safe)
-
-    # /files: 项目根 (转换输出目录的背景图等)
+    # /files: 项目根 (已有模板的背景图与简表预览图)
     app.mount('/files', StaticFiles(directory=root), name='files')
 
     # Vue 前端 SPA (dist 不存在时给出提示)
     @app.get('/{full_path:path}')
     def spa(full_path: str):
+        """优先返回前端静态文件，其他路径回退到 SPA 的 index.html。"""
         candidate = os.path.join(dist, full_path)
         if full_path and os.path.isfile(candidate):
             return FileResponse(candidate)
@@ -526,22 +426,21 @@ def create_app(root=ROOT):
 app = create_app()
 
 if __name__ == '__main__':
-    ap = argparse.ArgumentParser(description='表单模板服务')
+    ap = argparse.ArgumentParser(description='表单识别与匹配服务')
     ap.add_argument('--root', default=ROOT, help='项目根目录 (默认脚本所在)')
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--port', type=int, default=8000)
     cli = ap.parse_args()
     app = create_app(os.path.abspath(cli.root))
     import uvicorn
-    # Windows 控制台/重定向默认 GBK, 管线打印可能含 GBK 无法编码的字符
-    # (如排版引擎文字层解析出的 ¼ 类符号), 打印抛 UnicodeEncodeError 会把
-    # 整个 /upload 请求打挂; 重配 stdout/stderr 为 UTF-8 容错输出
+    # Windows 控制台/重定向默认 GBK, 识别文字可能含 GBK 无法编码的字符,
+    # 打印抛 UnicodeEncodeError 会中断请求; 重配 stdout/stderr 为 UTF-8 容错输出
     for _stream in (sys.stdout, sys.stderr):
         try:
             _stream.reconfigure(encoding='utf-8', errors='backslashreplace')
         except Exception:
             pass
-    print(f'表单模板服务: http://{cli.host}:{cli.port}')
+    print(f'表单识别与匹配服务: http://{cli.host}:{cli.port}')
     print(f'项目根: {os.path.abspath(cli.root)}')
     print('前端开发: cd frontend/frontend && npm run dev')
     uvicorn.run(app, host=cli.host, port=cli.port)

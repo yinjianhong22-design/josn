@@ -1,33 +1,25 @@
 # -*- coding: utf-8 -*-
+"""图像文件加载与 OpenCV 位图契约。
+
+下游统一接收 BGR 三通道 uint8 数组；路径解码和读取失败处理集中在输入层，
+避免识别算法混入平台相关的文件 I/O 差异。
+"""
 
 # ---------------------------------------------------------------------------
-# 加载: 图片/PDF -> 位图
+# 加载: 图片 -> 位图
 # ---------------------------------------------------------------------------
 
-from ..common import os, sys, cv2, np, _import_pymupdf
+import sys
+
+import cv2
+import numpy as np
 
 
-def load_image(path, page=0, dpi=300):
-    """加载图片；PDF 先用 PyMuPDF 按指定 dpi 渲染成位图。"""
-    ext = os.path.splitext(path)[1].lower()
-    if ext == '.pdf':
-        fitz = _import_pymupdf()
-        doc = fitz.open(path)
-        if not (0 <= page < len(doc)):
-            sys.exit(f'PDF 共 {len(doc)} 页, 无效的页码 {page}')
-        pix = doc[page].get_pixmap(dpi=dpi)
-        img = np.frombuffer(pix.samples, dtype=np.uint8)
-        img = img.reshape(pix.height, pix.width, pix.n)
-        if pix.n == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-        elif pix.n == 1:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        doc.close()
-        return img
+def load_image(path):
+    """加载图片并返回 OpenCV BGR 位图；解码失败时终止，不向下游返回 None。"""
     # cv2.imread 在 Windows 上走 ANSI 代码页, 中文路径读不出来;
-    # imdecode(fromfile) 按字节读盘, 与路径编码无关
-    # (np 用模块级 import, 这里不能再局部 import——否则整个函数里
-    #  np 变为局部名, 上面 PDF 分支提前使用会直接 UnboundLocalError)
+    # imdecode(fromfile) 按字节读盘, 与路径编码无关。
+    # IMREAD_COLOR 将灰度、彩色及带透明通道的输入统一解码为三通道 BGR。
     img = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         sys.exit(f'无法读取图片: {path}')

@@ -1,0 +1,17 @@
+# frpc 客户端配置 —— 运行在 Windows 本机，把本地 OCR 服务暴露到公网
+# 用法: deploy/bin/frpc.exe -c deploy/frpc.toml
+# 前置: 本机已启动 OCR 服务 (.venv/Scripts/python.exe ocr_service.py)
+
+serverAddr = "107.182.190.191"
+serverPort = 7000
+
+# 必须与 frps.toml 中的 auth.token 一致
+auth.method = "token"
+auth.token = "p7leZnk_Iy3qj7MQOXHlTV6YIcNNy-aRUvPylmLO81w"
+
+[[proxies]]
+name = "ocr"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8100
+remotePort = 18100

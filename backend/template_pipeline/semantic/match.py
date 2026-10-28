@@ -8,21 +8,29 @@ from .column_roles import normalize_column_role
 
 
 def match_data_fields(sheet, index, fuzzy_min=0.6):
-    """数据简表 JSON -> {values: {fieldUuid: 完整格文本}, unmatched}。
+    """将数据简表绑定到模板索引，返回待写回的完整单元格文本。
 
-    上下文区字段走 header_fields/by_label; 数据区按行标签和统一列角色路由。
-    values 不再是待拼接的原始值: inline/append 会结合 index.cells 的占位
-    信息物化成完整文本, 同一格多个字段的操作合并后再返回。
+    处理顺序为“上下文直连 -> 数据行精确/模糊匹配 -> 表头/表尾兜底”。
+    数据行命中后，按规定值、实测值、合格率的统一列角色寻址，不依赖模板
+    原始列名。fuzzy_min 是行标签的相似度下限，设为 0 或 None 可禁用模糊
+    匹配。
+
+    values 的键是值格 UUID；值已结合 index.cells 的绑定信息，按
+    overwrite/inline/append 物化为完整文本，同一格的多项操作会顺序合并。
+    unmatched 记录无法定位、缺值或值格不足的字段，ambiguous 记录模糊匹配
+    结果不唯一的字段，调用方可据此避免静默错填。
     """
     import re
 
     def norm(s):
+        # 匹配键忽略空白和量测符号，并统一全角括号，避免排版差异影响命中。
         s = str('' if s is None else s).translate(
             {ord('（'): '(', ord('）'): ')'})
         return re.sub(r'[\s△▲Δ]+', '', s)
 
     def text(v):
         if isinstance(v, float) and v.is_integer():
+            # 整数值的浮点数按整数输出，避免回填文本出现多余的“.0”。
             return str(int(v))
         return str(v)
 
@@ -46,6 +54,7 @@ def match_data_fields(sheet, index, fuzzy_min=0.6):
         binding = next((b for b in cell.get('bindings') or []
                         if norm(b.get('name')) == norm(field_name)), None)
         if binding is not None:
+            # 绑定中的 mode/prefix 等配置优先，同时保留单元格原文等属性。
             return {**cell, **binding}
         return cell
 
@@ -89,6 +98,8 @@ def match_data_fields(sheet, index, fuzzy_min=0.6):
         old = norm(current_value(u, field_name))
         return bool(old) and old == norm(v)
 
+    # 先按目标格收集操作，最后统一物化；共享格中的后续操作因此能基于
+    # 前一操作的结果合并，而不会各自覆盖原格文本。
     pending = {}
     unmatched = []
     ambiguous = []
@@ -120,6 +131,7 @@ def match_data_fields(sheet, index, fuzzy_min=0.6):
             return current[:start] + value + current[start:]
         end = segment_end(current, start, cell, binding)
         segment = current[start:end]
+        # 仅替换值段本体，保留原格中用于排版的段首尾空白。
         leading = segment[:len(segment) - len(segment.lstrip())]
         trailing = segment[len(segment.rstrip()):]
         return current[:start] + leading + value + trailing + current[end:]
@@ -155,6 +167,8 @@ def match_data_fields(sheet, index, fuzzy_min=0.6):
                     if not r.get('_matched') and norm(r.get('key')) == k),
                    None)
         if row is None and fuzzy_min:
+            # SequenceMatcher 给出 0~1 的字符序列相似度，用于容忍少量 OCR
+            # 误差；已消费行不参与候选，避免多个字段重复写入同一模板行。
             from difflib import SequenceMatcher
             candidates = []
             for r in rows:
@@ -168,6 +182,8 @@ def match_data_fields(sheet, index, fuzzy_min=0.6):
                 if ratio >= threshold:
                     candidates.append((ratio, r))
             candidates.sort(key=lambda item: item[0], reverse=True)
+            # 前两名分数接近时不强行取第一：保留 unmatched 比猜测目标行
+            # 更安全，也让调用方能够显式处理歧义。
             if len(candidates) > 1 \
                     and candidates[0][0] - candidates[1][0] <= 0.05:
                 ambiguous.append(name)
@@ -231,5 +247,6 @@ def match_data_fields(sheet, index, fuzzy_min=0.6):
         for operation in operations:
             result = apply_operation(result, operation, cell)
         if result != original:
+            # 只输出实际变化的值格，避免对未变化单元格进行无意义写回。
             values[u] = result
     return {'values': values, 'unmatched': unmatched, 'ambiguous': ambiguous}

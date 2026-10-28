@@ -1,0 +1,51 @@
+{
+  "form": {
+    "meta": {
+      "title": "公路工程项目土方路基抽检记录表"
+    }
+  },
+  "index": {
+    "cells": {
+      "ctx-time": {"text": ""},
+      "r1-specified": {"text": ""},
+      "r1-measured": {"text": ""},
+      "r1-pass": {"text": ""},
+      "r2-specified": {"text": ""},
+      "r2-measured": {"text": ""},
+      "r2-pass": {"text": ""},
+      "r3-specified": {"text": ""},
+      "r3-measured": {"text": ""},
+      "r3-pass": {"text": ""}
+    },
+    "header_fields": {
+      "抽检时间": "ctx-time"
+    },
+    "by_label": {},
+    "rows": [
+      {
+        "key": "压实度（%)",
+        "columns": {
+          "规定值": {"cell": "r1-specified"},
+          "实测值": {"cell": "r1-measured"},
+          "合格率": {"cell": "r1-pass"}
+        }
+      },
+      {
+        "key": "弯沉(0. 01mm)",
+        "columns": {
+          "规定值": {"cell": "r2-specified"},
+          "实测值": {"cell": "r2-measured"},
+          "合格率": {"cell": "r2-pass"}
+        }
+      },
+      {
+        "key": "宽度mm",
+        "columns": {
+          "规定值": {"cell": "r3-specified"},
+          "实测值": {"cell": "r3-measured"},
+          "合格率": {"cell": "r3-pass"}
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+# frps 服务端配置 —— 部署到公网服务器 107.182.190.191
+# 用法: ./frps -c ./frps.toml
+
+bindPort = 7000
+
+# 客户端接入鉴权，必须与 frpc.toml 中的 auth.token 一致
+auth.method = "token"
+auth.token = "p7leZnk_Iy3qj7MQOXHlTV6YIcNNy-aRUvPylmLO81w"
+
+# 限制 frpc 可申请的远端端口范围（防滥用；OCR 用 18100，预留 18100-18109 便于以后加服务）
+allowPorts = [
+  { start = 18100, end = 18109 },
+]

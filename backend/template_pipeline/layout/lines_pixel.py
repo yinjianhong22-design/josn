@@ -1,14 +1,26 @@
 # -*- coding: utf-8 -*-
+"""像素通路的图像二值化与表格线检测。
+
+所有掩码均为与原图同尺寸的单通道 uint8 图，线条、文字等前景为 255，
+背景为 0。处理链路依次完成自适应二值化、分方向形态学提取、断口闭合、
+投影定位和悬空假线过滤；坐标始终是整页像素坐标。
+"""
 
 # ---------------------------------------------------------------------------
 # 二值化 + 横竖线提取 (像素通路)
 # ---------------------------------------------------------------------------
 
-from ..common import cv2, np
+import cv2
+import numpy as np
 
 
 def binarize(gray):
-    """自适应阈值二值化, 返回线条/文字为白色(255)的图。"""
+    """把灰度图转成前景为白的自适应阈值二值图。
+
+    轻微高斯模糊先抑制扫描颗粒；15×15 局部均值阈值适应拍照件的光照不均，
+    BINARY_INV 使暗线条、暗文字成为白色前景，亮背景成为黑色。输出同时供
+    线检测与内容分析使用，因此文字笔画在此阶段不会被主动删除。
+    """
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     bw = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 10)
@@ -16,14 +28,15 @@ def binarize(gray):
 
 
 def extract_line_masks(bw, h_ratio=0.1, v_ratio=0.03):
-    """形态学开运算分离横线和竖线。
+    """用形态学开运算分离横线和竖线，返回 (横线掩码, 竖线掩码)。
 
-    核长度按图像尺寸比例取: 横线核较长(10%), 因为表格横线通常贯穿表宽;
-    竖线核较短(3%), 因为表格里存在只跨一两行的短竖线(表头分栏等),
-    核太长会把它们当噪声滤掉。文字、噪点、短笔画会被滤掉。
-    返回 (横线图, 竖线图)。
+    开运算只保留能容纳细长水平/垂直结构核的连续区域，文字和短笔画因无法
+    容纳核而被滤除。横线核默认取图宽 10%，因为表格横线通常贯穿表宽；竖线
+    核默认取图高 3%，以免滤掉表头分栏等只跨一两行的短竖线。核长另有 10
+    像素下限，避免小图上的核退化。
     """
     h, w = bw.shape
+    # 两个结构核都只在目标方向延伸，另一维保持为 1，以分离方向性笔画。
     h_kernel = cv2.getStructuringElement(
         cv2.MORPH_RECT, (max(10, int(w * h_ratio)), 1))
     v_kernel = cv2.getStructuringElement(
@@ -36,6 +49,7 @@ def extract_line_masks(bw, h_ratio=0.1, v_ratio=0.03):
 def close_gaps(mask, axis):
     """沿线条方向闭运算, 接合同方向的断口 (如扫描件缺墨、虚线)。"""
     h, w = mask.shape
+    # 接合核取对应图边长的约 1/50，小图至少 10px，仅沿线条方向补断口。
     if axis == 'h':
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, w // 50), 1))
     else:
@@ -68,6 +82,7 @@ def find_line_positions(mask, axis, min_len=20, gap=3, min_span=0.25,
     while i < len(on):
         if on[i]:
             j = i
+            # 允许向前跨过短空白并并入同一条带，避免一条粗线被拆成多条。
             while j + 1 < len(on) and (on[j + 1] or
                                  (j + gap < len(on) and on[j + 1:j + gap + 1].any())):
                 j += 1
@@ -84,6 +99,7 @@ def find_line_positions(mask, axis, min_len=20, gap=3, min_span=0.25,
             i += 1
     if not bands:
         return []
+    # 取整页阈值与最长线相对阈值的较小者，兼顾局部小表格和满页表格。
     if span_ratio:
         longest = max(s for _, s in bands)
         min_span = min(min_span, longest * span_ratio)
@@ -110,10 +126,11 @@ def _line_extent(mask, p, axis, bridge=12, wobble=2):
 
 
 def _merge_runs(flags, bridge):
-    """把布尔序列中为真的位置按"间距 ≤ bridge 可拼接"聚成 (lo, hi) 段。"""
+    """把真值位置按“索引间距 ≤ bridge 可拼接”聚成闭区间 (lo, hi) 段。"""
     idx = np.where(flags)[0]
     if idx.size == 0:
         return []
+    # 差分定位超过桥接距离的断点，再把段起止索引映射回原像素坐标。
     cuts = np.where(np.diff(idx) > bridge)[0]
     starts = np.r_[0, cuts + 1]
     ends = np.r_[cuts, idx.size - 1]
@@ -153,6 +170,7 @@ def filter_dangling_lines(pos, mask, axis, other_pos, other_mask=None,
                 continue
             if other_mask is None:
                 return True
+            # 位置相近还不够，对向线的实际延伸也必须覆盖本线坐标。
             ext = _line_extent(other_mask, o, 'v' if axis == 'h' else 'h')
             if ext is not None and ext[0] - tol <= p <= ext[1] + tol:
                 return True
@@ -161,6 +179,7 @@ def filter_dangling_lines(pos, mask, axis, other_pos, other_mask=None,
     kept = []
     for p, (lo, hi) in own:
         run = hi - lo
+        # 只统计真实延伸区间内的对向线，排除按无限延长线计算的假交叉。
         crossings = sum(1 for o in other_pos if lo <= o <= hi)
         if (run >= longest * run_exempt or
                 (end_anchored(p, lo) and end_anchored(p, hi)) or
